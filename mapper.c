@@ -83,7 +83,21 @@ static void to_reducer(int r, const msg_t *m)
  */
 static void take_checkpoint(long c)
 {
-    (void)c;
+    char path[64];
+    snprintf(path, sizeof path, CKPT_DIR "/m%d_%ld", args->id, c);
+    save_int(path, offset);
+
+    for (int r = 0; r < args->R; r++) {
+        msg_t msg = make(MT_FWD_CHECKPOINT);
+        msg.checkpoint_id = c;
+        to_reducer(r, &msg);
+    }
+
+    if (c) {
+        to_coordinator(MT_CHECKPOINT_ACK, c);
+    } else {
+        to_coordinator(MT_LAST_CHECKPOINT_ACK, c);
+    }
 }
 
 /*

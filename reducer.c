@@ -76,6 +76,11 @@ static void handle_control(void)
         if (m.type == MT_RECOVER)
             recover((long)m.checkpoint_id, m.recovery_id);
         else if (m.type == MT_EXIT) {
+            char path[64];
+            snprintf(path, sizeof path, CKPT_DIR "/r%d_%d", args->id,
+                     LAST_CHECKPOINT_ID);
+            if (wcmap_save(counts, path) != 0)
+                fail("wcmap_save");
             size_t pos = 0;
             const char *w;
             int64_t c, total = 0;
@@ -104,8 +109,27 @@ static int is_stale(const msg_t *m)
  */
 static void handle_marker(int j, long c)
 {
-    (void)j;
-    (void)c;
+    blocked[j] = 1;
+    for (int i = 0; i < args->M; i++) {
+        if (!blocked[i]) {
+            return;
+        }
+    }
+
+    char path[64];
+    snprintf(path, sizeof path, CKPT_DIR "/r%d_%ld", args->id, c);
+    if (wcmap_save(counts, path) != 0)
+        fail("wcmap_save");
+
+    if (c) {
+        to_coordinator(MT_CHECKPOINT_ACK, c);
+    } else {
+        to_coordinator(MT_LAST_CHECKPOINT_ACK, c);
+    }
+
+    for (int i = 0; i < args->M; i++) {
+        blocked[i] = 0;
+    }
 }
 
 /* PROVIDED: one message from connection i. */

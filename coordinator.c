@@ -18,6 +18,8 @@ struct wstate {
     int  heard;         /* current process has sent a heartbeat (its sockets are up) */
     long last_cp;       /* newest checkpoint this worker acknowledged */
     /* TODO: add whatever else you need per worker */
+    int done;
+    int waiting_to_exit;
 };
 
 static const config_t *cfg;
@@ -103,9 +105,31 @@ static void handle(const msg_t *m, long now)
         break;
     case MT_LAST_CHECKPOINT_ACK:
         /* TODO (Task 1) */
+        ws[w].waiting_to_exit = 1;
+
+        for (int i = 0; i < cfg->M + cfg->R; i++)
+            if (!ws[i].waiting_to_exit)
+                return;
+
+        set_phase(PH_EXITING);
+
+        for (int i = 0; i < cfg->M + cfg->R; i++) {
+            send_to(i, MT_EXIT, 0);
+        }
         break;
     case MT_DONE:
         /* TODO (Task 1) */
+        ws[w].done = 1;
+
+        for (int i = 0; i < cfg->M; i++)
+            if (!ws[i].done)
+                return;
+
+        set_phase(PH_LAST_CP);
+
+        for (int i = 0; i < cfg->M; i++) {
+            send_to(i, MT_CHECKPOINT, 0);
+        }
         break;
     case MT_RECOVERY_ACK:
         /* TODO (Task 3) */
@@ -125,6 +149,8 @@ int coordinator_loop(const config_t *c, job_t *j)
         memset(&ws[w], 0, sizeof ws[w]);
         ws[w].last_hb = now;
         ws[w].last_cp = NO_CHECKPOINT;
+        ws[w].done = 0;
+        ws[w].waiting_to_exit = 0;
     }
     phase = PH_CP;
     rid = 0;
@@ -152,6 +178,14 @@ int coordinator_loop(const config_t *c, job_t *j)
 
         if (phase == PH_EXITING) {
             /* TODO (Task 1). */
+            int all_exited = 1;
+            for (int i = 0; i < cfg->M + cfg->R; i++) {
+                if (!job->exited[i]) {
+                    all_exited = 0;
+                    break;
+                }
+            }
+            if (all_exited) return 0;
             continue;
         }
 
