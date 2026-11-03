@@ -28,6 +28,8 @@ static struct wstate  ws[MAX_WORKERS];
 static enum phase     phase;
 static int            rid;              /* current recovery id */
 static long           next_cp_id = 1;   /* never reused */
+static long           last_cp_trigger_time;
+static long           checkpoint_in_progress = NO_CHECKPOINT;
 
 static const char *phase_name[] = {
     "CP", "RECOVER_REDUCER", "RECOVER_MAPPER", "LAST_CP", "EXITING",
@@ -67,6 +69,29 @@ static void send_to(int w, int type, long cp)
     udp_send(job->fd, worker_port(cfg->base_port, cfg->M, role, id), &m);
 }
 
+static int all_mappers_done(void)
+{
+    for (int i = 0; i < cfg->M; i++)
+        if (!ws[i].done)
+            return 0;
+    return 1;
+}
+
+static int checkpoint_complete(void)
+{
+    for (int i = 0; i < job->n; i++)
+        if (ws[i].last_cp != checkpoint_in_progress)
+            return 0;
+    return 1;
+}
+
+static void start_last_checkpoint(void)
+{
+    set_phase(PH_LAST_CP);
+    for (int i = 0; i < cfg->M; i++)
+        send_to(i, MT_CHECKPOINT, LAST_CHECKPOINT_ID);
+}
+
 /*
  * TODO (Task 3)
  */
@@ -102,34 +127,33 @@ static void handle(const msg_t *m, long now)
     switch (m->type) {
     case MT_CHECKPOINT_ACK:
         /* TODO (Task 2) */
+        ws[w].last_cp = m->checkpoint_id;
+        if (m->checkpoint_id == checkpoint_in_progress &&
+            checkpoint_complete()) {
+            checkpoint_in_progress = NO_CHECKPOINT;
+            if (all_mappers_done())
+                start_last_checkpoint();
+        }
         break;
     case MT_LAST_CHECKPOINT_ACK:
         /* TODO (Task 1) */
         ws[w].waiting_to_exit = 1;
 
-        for (int i = 0; i < cfg->M + cfg->R; i++)
+        for (int i = 0; i < job->n; i++)
             if (!ws[i].waiting_to_exit)
                 return;
 
         set_phase(PH_EXITING);
 
-        for (int i = 0; i < cfg->M + cfg->R; i++) {
+        for (int i = 0; i < job->n; i++) {
             send_to(i, MT_EXIT, 0);
         }
         break;
     case MT_DONE:
         /* TODO (Task 1) */
         ws[w].done = 1;
-
-        for (int i = 0; i < cfg->M; i++)
-            if (!ws[i].done)
-                return;
-
-        set_phase(PH_LAST_CP);
-
-        for (int i = 0; i < cfg->M; i++) {
-            send_to(i, MT_CHECKPOINT, 0);
-        }
+        if (all_mappers_done() && checkpoint_in_progress == NO_CHECKPOINT)
+            start_last_checkpoint();
         break;
     case MT_RECOVERY_ACK:
         /* TODO (Task 3) */
@@ -154,6 +178,8 @@ int coordinator_loop(const config_t *c, job_t *j)
     }
     phase = PH_CP;
     rid = 0;
+    last_cp_trigger_time = now;
+    checkpoint_in_progress = NO_CHECKPOINT;
 
     for (;;) {
         chaos_tick(job);        /* PROVIDED: do not remove */
@@ -164,6 +190,16 @@ int coordinator_loop(const config_t *c, job_t *j)
             return 1;
         }
         now = now_ms();
+
+        if (phase == PH_CP && checkpoint_in_progress == NO_CHECKPOINT &&
+            cfg->interval_ms > 0 &&
+            now - last_cp_trigger_time >= cfg->interval_ms) {
+            last_cp_trigger_time = now;
+            checkpoint_in_progress = next_cp_id;
+            for (int i = 0; i < cfg->M; i++)
+                send_to(i, MT_CHECKPOINT, checkpoint_in_progress);
+            next_cp_id++;
+        }
 
         msg_t m;
         int r;
@@ -179,7 +215,7 @@ int coordinator_loop(const config_t *c, job_t *j)
         if (phase == PH_EXITING) {
             /* TODO (Task 1). */
             int all_exited = 1;
-            for (int i = 0; i < cfg->M + cfg->R; i++) {
+            for (int i = 0; i < job->n; i++) {
                 if (!job->exited[i]) {
                     all_exited = 0;
                     break;
