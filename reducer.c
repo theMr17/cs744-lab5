@@ -60,8 +60,10 @@ static void close_conn(int i)
  */
 static void recover(long c, int new_rid)
 {
-    if (new_rid <= rid)
+    if (new_rid <= rid) {
+        wlog("ignored RECOVER cp=%ld rid=%d (mine: rid=%d)", c, new_rid, rid);
         return;
+    }
 
     char path[64];
     snprintf(path, sizeof(path), CKPT_DIR "/r%d_%ld", args->id, c);
@@ -82,6 +84,7 @@ static void recover(long c, int new_rid)
 
     rid = new_rid;
 
+    wlog("recovered checkpoint cp=%ld; cleared mapper connections", c);
     to_coordinator(MT_RECOVERY_ACK, c);
 }
 
@@ -103,6 +106,9 @@ static void handle_control(void)
         if (m.type == MT_RECOVER) {
             if (!is_stale(&m))
                 recover((long)m.checkpoint_id, m.recovery_id);
+            else
+                wlog("ignored stale RECOVER cp=%ld rid=%d (mine: rid=%d)",
+                     (long)m.checkpoint_id, m.recovery_id, rid);
         }
         else if (m.type == MT_EXIT) {
             char path[64];
@@ -129,10 +135,14 @@ static void handle_control(void)
  */
 static void handle_marker(int j, long c)
 {
-    if (blocked[j])
+    if (blocked[j]) {
+        wlog("ignored duplicate marker from mapper %d cp=%ld", j, c);
         return;
+    }
     blocked[j] = 1;
     nblocked++;
+    wlog("blocked mapper %d at checkpoint cp=%ld (%d/%d)", j, c,
+         nblocked, args->M);
     if (nblocked < args->M) {
         return;
     }
@@ -141,6 +151,7 @@ static void handle_marker(int j, long c)
     snprintf(path, sizeof path, CKPT_DIR "/r%d_%ld", args->id, c);
     if (wcmap_save(counts, path) != 0)
         fail("wcmap_save");
+    wlog("saved checkpoint cp=%ld after all %d mappers blocked", c, args->M);
 
     if (c) {
         to_coordinator(MT_CHECKPOINT_ACK, c);
@@ -237,6 +248,7 @@ void reducer_main(const worker_args_t *a)
             int fd;
             while ((fd = tcp_accept(a->listen_fd)) >= 0) {
                 if (nconn == MAX_CONN) {
+                    wlog("rejected mapper connection: connection limit reached");
                     close(fd);
                     continue;
                 }

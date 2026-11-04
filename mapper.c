@@ -86,6 +86,7 @@ static void take_checkpoint(long c)
     char path[64];
     snprintf(path, sizeof path, CKPT_DIR "/m%d_%ld", args->id, c);
     save_int(path, offset);
+    wlog("saved checkpoint cp=%ld at offset %ld", c, offset);
 
     for (int r = 0; r < args->R; r++) {
         msg_t msg = make(MT_FWD_CHECKPOINT);
@@ -106,6 +107,7 @@ static void take_checkpoint(long c)
 static void recover(long c, int new_rid)
 {
     if (new_rid <= rid) {
+        wlog("ignored RECOVER cp=%ld rid=%d (mine: rid=%d)", c, new_rid, rid);
         return;
     }
 
@@ -120,6 +122,7 @@ static void recover(long c, int new_rid)
     disconnect_all();
     connect_all();
 
+    wlog("recovered checkpoint cp=%ld; resuming at offset %ld", c, offset);
     to_coordinator(MT_RECOVERY_ACK, c);
 }
 
@@ -134,10 +137,15 @@ static void poll_control(void)
              rid, offset, broken ? " broken" : "");
         switch (m.type) {
         case MT_CHECKPOINT:
-            if (m.recovery_id == rid && !broken)
+            if (m.recovery_id == rid && !broken) {
+                wlog("starting checkpoint cp=%ld at offset %ld",
+                     (long)m.checkpoint_id, offset);
                 take_checkpoint((long)m.checkpoint_id);
-            else
-                wlog("   ignored: stale recovery id or broken");
+            } else {
+                wlog("ignored CHECKPOINT cp=%ld rid=%d (%s)",
+                     (long)m.checkpoint_id, m.recovery_id,
+                     broken ? "reducer connection broken" : "stale recovery id");
+            }
             break;
         case MT_RECOVER:
             recover((long)m.checkpoint_id, m.recovery_id);

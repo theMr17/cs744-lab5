@@ -91,6 +91,7 @@ static int checkpoint_complete(void)
 static void start_last_checkpoint(void)
 {
     set_phase(PH_LAST_CP);
+    wlog("all mapper work is complete; starting final checkpoint");
     for (int i = 0; i < cfg->M; i++)
         send_to(i, MT_CHECKPOINT, LAST_CHECKPOINT_ID);
 }
@@ -132,6 +133,8 @@ static void start_recovery(void)
     for (int i = 0; i < job->n; i++)
         ws[i].last_cp = recovery_checkpoint;
 
+    wlog("starting recovery rid=%d from checkpoint cp=%ld", rid,
+         recovery_checkpoint);
     for (int i = job->M; i < job->n; i++) {
         send_to(i, MT_RECOVER, recovery_checkpoint);
         ws[i].recovery_sent = ws[i].heard;
@@ -167,8 +170,11 @@ static void handle(const msg_t *m, long now)
          msg_type_name(m->type), (long)m->checkpoint_id, m->recovery_id,
          rid, phase_name[phase]);
 
-    if (m->recovery_id != rid)
+    if (m->recovery_id != rid) {
+        wlog("ignored stale %s from %s (its rid=%d, mine=%d)",
+             msg_type_name(m->type), wname(w), m->recovery_id, rid);
         return;
+    }
 
     switch (m->type) {
     case MT_CHECKPOINT_ACK:
@@ -176,9 +182,12 @@ static void handle(const msg_t *m, long now)
         if (phase != PH_CP || m->checkpoint_id <= 0)
             break;
         ws[w].last_cp = m->checkpoint_id;
+        wlog("%s acknowledged checkpoint cp=%ld", wname(w),
+             (long)m->checkpoint_id);
         if (m->checkpoint_id == checkpoint_in_progress &&
             checkpoint_complete()) {
             checkpoint_in_progress = NO_CHECKPOINT;
+            wlog("checkpoint cp=%ld complete", (long)m->checkpoint_id);
             if (all_mappers_done())
                 start_last_checkpoint();
         }
@@ -188,6 +197,7 @@ static void handle(const msg_t *m, long now)
         if (phase != PH_LAST_CP || m->checkpoint_id != LAST_CHECKPOINT_ID)
             break;
         ws[w].waiting_to_exit = 1;
+        wlog("%s acknowledged final checkpoint", wname(w));
 
         for (int i = 0; i < job->n; i++)
             if (!ws[i].waiting_to_exit)
@@ -204,6 +214,7 @@ static void handle(const msg_t *m, long now)
         if (phase != PH_CP || m->role != ROLE_MAPPER)
             break;
         ws[w].done = 1;
+        wlog("%s completed its assigned files", wname(w));
         if (all_mappers_done() && checkpoint_in_progress == NO_CHECKPOINT)
             start_last_checkpoint();
         break;
@@ -213,14 +224,18 @@ static void handle(const msg_t *m, long now)
             m->checkpoint_id != recovery_checkpoint)
             break;
         ws[w].recovered = 1;
+           wlog("%s recovered from checkpoint cp=%ld", wname(w),
+               (long)m->checkpoint_id);
         if (m->role == ROLE_REDUCER && all_reducers_recovered()) {
             set_phase(PH_RECOVER_MAPPER);
             for (int i = 0; i < job->M; i++) {
                 send_to(i, MT_RECOVER, recovery_checkpoint);
                 ws[i].recovery_sent = 1;
             }
+            wlog("all reducers recovered; sent RECOVER to mappers");
         } else if (m-> role == ROLE_MAPPER && all_mappers_recovered()) {
             set_phase(PH_CP);
+            wlog("all mappers recovered; resuming checkpoint phase");
         }
         break;
     default:
@@ -262,6 +277,7 @@ int coordinator_loop(const config_t *c, job_t *j)
             now - last_cp_trigger_time >= cfg->interval_ms) {
             last_cp_trigger_time = now;
             checkpoint_in_progress = next_cp_id;
+            wlog("starting checkpoint cp=%ld", checkpoint_in_progress);
             for (int i = 0; i < cfg->M; i++)
                 send_to(i, MT_CHECKPOINT, checkpoint_in_progress);
             next_cp_id++;
@@ -295,6 +311,7 @@ int coordinator_loop(const config_t *c, job_t *j)
         if (phase != PH_EXITING) {
             for (int i = 0; i < job->n; i++) {
                 if (now - ws[i].last_hb > HEARTBEAT_TIMEOUT_MS) {
+                    wlog("%s missed heartbeat; respawning and recovering", wname(i));
                     rid++;
                     if (respawn_worker(job, cfg, i) != 0)
                         return 1;
