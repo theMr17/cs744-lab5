@@ -60,10 +60,37 @@ static void close_conn(int i)
  */
 static void recover(long c, int new_rid)
 {
-    (void)c;
-    (void)new_rid;
-    (void)to_coordinator;           /* TODO: remove */
-    (void)nblocked;
+    if (new_rid <= rid)
+        return;
+
+    char path[64];
+    snprintf(path, sizeof(path), CKPT_DIR "/r%d_%ld", args->id, c);
+    wcmap_t *restored = wcmap_load(path);
+    if (!restored)
+        fail("wcmap_load");
+
+    wcmap_free(counts);
+    counts = restored;
+
+    while (nconn > 0)
+        close_conn(nconn - 1);
+
+    for (int i = 0; i < args->M; i++) {
+        blocked[i] = 0;
+    }
+    nblocked = 0;
+
+    rid = new_rid;
+
+    to_coordinator(MT_RECOVERY_ACK, c);
+}
+
+/*
+ * TODO (Task 3)
+ */
+static int is_stale(const msg_t *m)
+{
+    return m->recovery_id < rid;
 }
 
 static void handle_control(void)
@@ -73,8 +100,10 @@ static void handle_control(void)
     while ((r = udp_recv(args->ctl_fd, &m)) == 1) {
         wlog("<- coordinator: %s cp=%ld rid=%d (mine: rid=%d, %d blocked)",
              msg_type_name(m.type), (long)m.checkpoint_id, m.recovery_id, rid, nblocked);
-        if (m.type == MT_RECOVER)
-            recover((long)m.checkpoint_id, m.recovery_id);
+        if (m.type == MT_RECOVER) {
+            if (!is_stale(&m))
+                recover((long)m.checkpoint_id, m.recovery_id);
+        }
         else if (m.type == MT_EXIT) {
             char path[64];
             snprintf(path, sizeof path, CKPT_DIR "/r%d_%d", args->id,
@@ -96,24 +125,16 @@ static void handle_control(void)
 }
 
 /*
- * TODO (Task 3)
- */
-static int is_stale(const msg_t *m)
-{
-    (void)m;
-    return 0;
-}
-
-/*
  * TODO (Task 1, Task 2)
  */
 static void handle_marker(int j, long c)
 {
+    if (blocked[j])
+        return;
     blocked[j] = 1;
-    for (int i = 0; i < args->M; i++) {
-        if (!blocked[i]) {
-            return;
-        }
+    nblocked++;
+    if (nblocked < args->M) {
+        return;
     }
 
     char path[64];
@@ -130,6 +151,7 @@ static void handle_marker(int j, long c)
     for (int i = 0; i < args->M; i++) {
         blocked[i] = 0;
     }
+    nblocked = 0;
 }
 
 /* PROVIDED: one message from connection i. */

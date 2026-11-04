@@ -20,6 +20,8 @@ struct wstate {
     /* TODO: add whatever else you need per worker */
     int done;
     int waiting_to_exit;
+    int recovered;
+    int recovery_sent;
 };
 
 static const config_t *cfg;
@@ -30,6 +32,7 @@ static int            rid;              /* current recovery id */
 static long           next_cp_id = 1;   /* never reused */
 static long           last_cp_trigger_time;
 static long           checkpoint_in_progress = NO_CHECKPOINT;
+static long           recovery_checkpoint = NO_CHECKPOINT;
 
 static const char *phase_name[] = {
     "CP", "RECOVER_REDUCER", "RECOVER_MAPPER", "LAST_CP", "EXITING",
@@ -92,11 +95,47 @@ static void start_last_checkpoint(void)
         send_to(i, MT_CHECKPOINT, LAST_CHECKPOINT_ID);
 }
 
+static int all_mappers_recovered(void)
+{
+    for (int i = 0; i < cfg->M; i++)
+        if (!ws[i].recovered)
+            return 0;
+    return 1;
+}
+
+static int all_reducers_recovered(void)
+{
+    for (int i = cfg->M; i < cfg->M + cfg->R; i++)
+        if (!ws[i].recovered)
+            return 0;
+    return 1;
+}
+
 /*
  * TODO (Task 3)
  */
 static void start_recovery(void)
 {
+    set_phase(PH_RECOVER_REDUCER);
+
+    long restore_cp = LONG_MAX;
+    for (int i = 0; i < job->n; i++) {
+        if (ws[i].last_cp != NO_CHECKPOINT && ws[i].last_cp < restore_cp)
+            restore_cp = ws[i].last_cp;
+        ws[i].done = 0;
+        ws[i].waiting_to_exit = 0;
+        ws[i].recovered = 0;
+        ws[i].recovery_sent = 0;
+    }
+    recovery_checkpoint = restore_cp == LONG_MAX ? NO_CHECKPOINT : restore_cp;
+    checkpoint_in_progress = NO_CHECKPOINT;
+    for (int i = 0; i < job->n; i++)
+        ws[i].last_cp = recovery_checkpoint;
+
+    for (int i = job->M; i < job->n; i++) {
+        send_to(i, MT_RECOVER, recovery_checkpoint);
+        ws[i].recovery_sent = ws[i].heard;
+    }
 }
 
 /* One message from a worker. */
@@ -114,6 +153,12 @@ static void handle(const msg_t *m, long now)
                 wlog("%s is up (pid %ld)", wname(w), (long)m->count);
             ws[w].last_hb = now;
             ws[w].heard = 1;
+            if (!ws[w].recovery_sent && !ws[w].recovered &&
+                ((phase == PH_RECOVER_REDUCER && w >= cfg->M) ||
+                 (phase == PH_RECOVER_MAPPER && w < cfg->M))) {
+                send_to(w, MT_RECOVER, recovery_checkpoint);
+                ws[w].recovery_sent = 1;
+            }
         }
         return;
     }
@@ -122,11 +167,14 @@ static void handle(const msg_t *m, long now)
          msg_type_name(m->type), (long)m->checkpoint_id, m->recovery_id,
          rid, phase_name[phase]);
 
-    /* TODO (Task 3): ignore messages from before the last rollback. */
+    if (m->recovery_id != rid)
+        return;
 
     switch (m->type) {
     case MT_CHECKPOINT_ACK:
         /* TODO (Task 2) */
+        if (phase != PH_CP || m->checkpoint_id <= 0)
+            break;
         ws[w].last_cp = m->checkpoint_id;
         if (m->checkpoint_id == checkpoint_in_progress &&
             checkpoint_complete()) {
@@ -137,6 +185,8 @@ static void handle(const msg_t *m, long now)
         break;
     case MT_LAST_CHECKPOINT_ACK:
         /* TODO (Task 1) */
+        if (phase != PH_LAST_CP || m->checkpoint_id != LAST_CHECKPOINT_ID)
+            break;
         ws[w].waiting_to_exit = 1;
 
         for (int i = 0; i < job->n; i++)
@@ -151,12 +201,27 @@ static void handle(const msg_t *m, long now)
         break;
     case MT_DONE:
         /* TODO (Task 1) */
+        if (phase != PH_CP || m->role != ROLE_MAPPER)
+            break;
         ws[w].done = 1;
         if (all_mappers_done() && checkpoint_in_progress == NO_CHECKPOINT)
             start_last_checkpoint();
         break;
     case MT_RECOVERY_ACK:
         /* TODO (Task 3) */
+        if ((phase != PH_RECOVER_REDUCER && phase != PH_RECOVER_MAPPER) ||
+            m->checkpoint_id != recovery_checkpoint)
+            break;
+        ws[w].recovered = 1;
+        if (m->role == ROLE_REDUCER && all_reducers_recovered()) {
+            set_phase(PH_RECOVER_MAPPER);
+            for (int i = 0; i < job->M; i++) {
+                send_to(i, MT_RECOVER, recovery_checkpoint);
+                ws[i].recovery_sent = 1;
+            }
+        } else if (m-> role == ROLE_MAPPER && all_mappers_recovered()) {
+            set_phase(PH_CP);
+        }
         break;
     default:
         break;
@@ -180,6 +245,7 @@ int coordinator_loop(const config_t *c, job_t *j)
     rid = 0;
     last_cp_trigger_time = now;
     checkpoint_in_progress = NO_CHECKPOINT;
+    recovery_checkpoint = NO_CHECKPOINT;
 
     for (;;) {
         chaos_tick(job);        /* PROVIDED: do not remove */
@@ -226,11 +292,18 @@ int coordinator_loop(const config_t *c, job_t *j)
         }
 
         /* TODO (Task 3) */
-        (void)start_recovery;
-
-        /* TODO: phase actions. */
-        (void)send_to;
-        (void)set_phase;
-        (void)next_cp_id;
+        if (phase != PH_EXITING) {
+            for (int i = 0; i < job->n; i++) {
+                if (now - ws[i].last_hb > HEARTBEAT_TIMEOUT_MS) {
+                    rid++;
+                    if (respawn_worker(job, cfg, i) != 0)
+                        return 1;
+                    ws[i].heard = 0;
+                    ws[i].last_hb = now;
+                    start_recovery();
+                    break;
+                }
+            }
+        }
     }
 }

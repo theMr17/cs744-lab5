@@ -105,8 +105,22 @@ static void take_checkpoint(long c)
  */
 static void recover(long c, int new_rid)
 {
-    (void)c;
-    (void)new_rid;
+    if (new_rid <= rid) {
+        return;
+    }
+
+    char path[64];
+    snprintf(path, sizeof(path), CKPT_DIR "/m%d_%ld", args->id, c);
+    if (load_int(path, &offset) != 0)
+        fail("load_int");
+
+    rid = new_rid;
+    broken = 0;
+
+    disconnect_all();
+    connect_all();
+
+    to_coordinator(MT_RECOVERY_ACK, c);
 }
 
 /* Handle every message waiting on the control socket. */
